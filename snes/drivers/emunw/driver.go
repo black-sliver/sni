@@ -117,6 +117,18 @@ func (d *Driver) Detect() (devices []snes.DeviceDescriptor, err error) {
 				}
 			}
 
+			{
+				// check emulator status:
+				var status []map[string]string
+				_, status, err = detector.SendCommandWaitReply("EMU_STATUS", time.Now().Add(time.Millisecond*32))
+				if err != nil {
+					return
+				}
+				if logDetector {
+					log.Printf("emunw: detect: detector[%d]:\n%+v\n", i, status)
+				}
+			}
+
 			descriptor := snes.DeviceDescriptor{
 				Uri:                 url.URL{Scheme: driverName, Host: detector.addr.String()},
 				DisplayName:         fmt.Sprintf("EmuNW (%s)", detector.addr),
