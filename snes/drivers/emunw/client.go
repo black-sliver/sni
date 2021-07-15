@@ -120,6 +120,9 @@ func (c *Client) parseCommandResponse(deadline time.Time) (bin []byte, ascii []m
 	item := make(map[string]string)
 	for s.Scan() {
 		l := s.Text()
+		if l == "" {
+			break
+		}
 		pair := strings.SplitN(l, ":", 2)
 		var key string = pair[0]
 		var value string
