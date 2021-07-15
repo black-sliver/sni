@@ -1,13 +1,18 @@
 package emunw
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"google.golang.org/grpc/codes"
 	"net"
 	"sni/protos/sni"
 	"sni/snes"
+	"sni/snes/mapping"
+	"strings"
 	"time"
 )
 
@@ -84,7 +89,78 @@ func (c *Client) writeWithDeadline(bytes []byte, deadline time.Time) (err error)
 		return
 	}
 	_, err = c.c.Write(bytes)
+	if err != nil {
+		_ = c.Close()
+		return
+	}
 	return
+}
+
+func (c *Client) readWithDeadline(b []byte, deadline time.Time) (n int, err error) {
+	err = c.c.SetReadDeadline(deadline)
+	if err != nil {
+		return
+	}
+	n, err = c.c.Read(b)
+	if err != nil {
+		_ = c.Close()
+		return
+	}
+	return
+}
+
+func (c *Client) parseCommandResponse(deadline time.Time) (bin []byte, ascii []map[string]string, err error) {
+	var n int
+	// TODO: hope that packets Read() don't contain multiple responses
+	b := make([]byte, 65536)
+	n, err = c.readWithDeadline(b, deadline)
+	if err != nil {
+		_ = c.Close()
+		return
+	}
+
+	d := b[:n]
+	// parse binary reply:
+	if d[0] == 0 {
+		size := binary.BigEndian.Uint32(d[1 : 1+4])
+		bin = b[5 : 5+size]
+		return
+	}
+	// expect ascii reply otherwise:
+	if d[0] != '\n' {
+		err = fmt.Errorf("emunw: command reply expected starting with '\\0' or '\\n' but got '%c'", d[0])
+		return
+	}
+
+	// parse ascii reply as array<map<string,string>>:
+	s := bufio.NewScanner(bytes.NewReader(d[1:]))
+	ascii = make([]map[string]string, 0, 4)
+	item := make(map[string]string)
+	for s.Scan() {
+		l := s.Text()
+		pair := strings.SplitN(l, ":", 2)
+		key, value := pair[0], pair[1]
+
+		// duplicate keys delimit multiple items:
+		if _, hasKey := item[key]; hasKey {
+			ascii = append(ascii, item)
+			item = make(map[string]string)
+		}
+
+		item[key] = value
+	}
+	if len(item) > 0 {
+		ascii = append(ascii, item)
+	}
+
+	return
+}
+
+type memRegion struct {
+	mapping.MemoryType
+	Offset uint32
+	Size   int
+	Data   []byte
 }
 
 func (c *Client) MultiReadMemory(ctx context.Context, reads ...snes.MemoryReadRequest) (mrsp []snes.MemoryReadResponse, err error) {
@@ -93,7 +169,69 @@ func (c *Client) MultiReadMemory(ctx context.Context, reads ...snes.MemoryReadRe
 		deadline = time.Now().Add(c.readWriteTimeout)
 	}
 
-	err = c.writeWithDeadline([]byte("EMU_RESET\n"), deadline)
+	mrsp = make([]snes.MemoryReadResponse, len(reads))
+
+	// annoyingly, we must track the unique memType keys so we can iterate the map in a consistent order:
+	memTypes := make([]mapping.MemoryType, 0, len(reads))
+	readGroups := make(map[mapping.MemoryType][]memRegion)
+
+	// divide up the reads into memory type groups:
+	for j, read := range reads {
+		a := &read.RequestAddress
+		memType, pakAddress, offset := mapping.MemoryTypeFor(a)
+
+		mrsp[j].RequestAddress = read.RequestAddress
+		mrsp[j].DeviceAddress = snes.AddressTuple{
+			Address:       pakAddress,
+			AddressSpace:  sni.AddressSpace_FxPakPro,
+			MemoryMapping: read.RequestAddress.MemoryMapping,
+		}
+		mrsp[j].DeviceAddress.Address = pakAddress
+		mrsp[j].Data = make([]byte, read.Size)
+
+		regions, ok := readGroups[memType]
+		if !ok {
+			memTypes = append(memTypes, memType)
+		}
+		readGroups[memType] = append(regions, memRegion{
+			MemoryType: memType,
+			Offset:     offset,
+			Size:       read.Size,
+			Data:       mrsp[j].Data,
+		})
+	}
+
+	// write commands:
+	for _, memType := range memTypes {
+		regions := readGroups[memType]
+		sb := bytes.Buffer{}
+		_, _ = fmt.Fprintf(&sb, "CORE_READ %s", memType)
+		for _, region := range regions {
+			_, _ = fmt.Fprintf(&sb, ";$%x;$%x", region.Offset, region.Size)
+		}
+		sb.WriteByte('\n')
+		err = c.writeWithDeadline(sb.Bytes(), deadline)
+	}
+
+	// read back responses:
+	for _, memType := range memTypes {
+		var bin []byte
+		var ascii []map[string]string
+		bin, ascii, err = c.parseCommandResponse(deadline)
+		if err != nil {
+			return
+		}
+		if ascii != nil {
+			err = fmt.Errorf("emunw: expecting binary reply but got ascii:\n%+v", ascii)
+		}
+
+		regions := readGroups[memType]
+		offset := 0
+		for _, region := range regions {
+			copy(region.Data, bin[offset:offset+region.Size])
+			offset += region.Size
+		}
+	}
 
 	err = nil
 	return

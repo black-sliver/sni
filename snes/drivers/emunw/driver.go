@@ -70,7 +70,7 @@ func (d *Driver) HasCapabilities(capabilities ...sni.DeviceCapability) (bool, er
 func (d *Driver) openDevice(uri *url.URL) (q snes.Device, err error) {
 	// create a new device with its own connection:
 	var addr *net.TCPAddr
-	addr, err = net.ResolveTCPAddr("udp", uri.Host)
+	addr, err = net.ResolveTCPAddr("tcp", uri.Host)
 	if err != nil {
 		return
 	}
@@ -164,7 +164,7 @@ func DriverInit() {
 	// comma-delimited list of host:port pairs:
 	hostsStr := env.GetOrSupply("SNI_EMUNW_HOSTS", func() string {
 		var sb strings.Builder
-		const count = 1
+		const count = 10
 		for i := 0; i < count; i++ {
 			sb.WriteString(fmt.Sprintf("localhost:%d", 65400+i))
 			if i < count-1 {
