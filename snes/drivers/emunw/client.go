@@ -11,6 +11,7 @@ import (
 	"sni/snes"
 	"sni/snes/mapping"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,7 @@ type Client struct {
 	addr *net.TCPAddr
 	name string
 
+	lock        sync.Mutex
 	c           *net.TCPConn
 	isConnected bool
 	isClosed    bool
@@ -86,6 +88,28 @@ func (c *Client) readWithDeadline(b []byte, deadline time.Time) (n int, err erro
 	if err != nil {
 		_ = c.Close()
 		return
+	}
+	return
+}
+
+func (c *Client) SendCommandWaitReply(cmd string, deadline time.Time) (bin []byte, ascii []map[string]string, err error) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	b := bytes.NewBuffer(make([]byte, 0, len(cmd)+1))
+	b.WriteString(cmd)
+	b.WriteByte('\n')
+	err = c.writeWithDeadline(b.Bytes(), deadline)
+	if err != nil {
+		return
+	}
+
+	bin, ascii, err = c.parseCommandResponse(deadline)
+	if ascii != nil {
+		if errText, ok := ascii[0]["error"]; ok {
+			err = fmt.Errorf("emunw: error=%s", errText)
+			return
+		}
 	}
 	return
 }
@@ -191,6 +215,8 @@ func (c *Client) MultiReadMemory(ctx context.Context, reads ...snes.MemoryReadRe
 	}
 
 	// write commands:
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	for _, memType := range memTypes {
 		regions := readGroups[memType]
 		sb := bytes.Buffer{}
@@ -268,6 +294,8 @@ func (c *Client) MultiWriteMemory(ctx context.Context, writes ...snes.MemoryWrit
 	}
 
 	// write commands:
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	for _, memType := range memTypes {
 		regions := writeGroups[memType]
 
@@ -329,20 +357,7 @@ func (c *Client) ResetSystem(ctx context.Context) (err error) {
 		deadline = time.Now().Add(c.readWriteTimeout)
 	}
 
-	err = c.writeWithDeadline([]byte("EMU_RESET\n"), deadline)
-	if err != nil {
-		return
-	}
-
-	var ascii []map[string]string
-	_, ascii, err = c.parseCommandResponse(deadline)
-	if ascii != nil {
-		if errText, ok := ascii[0]["error"]; ok {
-			err = fmt.Errorf("emunw: error=%s", errText)
-			return
-		}
-	}
-
+	_, _, err = c.SendCommandWaitReply("EMU_RESET", deadline)
 	return
 }
 
@@ -354,21 +369,9 @@ func (c *Client) PauseUnpause(ctx context.Context, pausedState bool) (newState b
 
 	newState = pausedState
 	if pausedState {
-		err = c.writeWithDeadline([]byte("EMU_PAUSE\n"), deadline)
+		_, _, err = c.SendCommandWaitReply("EMU_PAUSE", deadline)
 	} else {
-		err = c.writeWithDeadline([]byte("EMU_RESUME\n"), deadline)
-	}
-	if err != nil {
-		return
-	}
-
-	var ascii []map[string]string
-	_, ascii, err = c.parseCommandResponse(deadline)
-	if ascii != nil {
-		if errText, ok := ascii[0]["error"]; ok {
-			err = fmt.Errorf("emunw: error=%s", errText)
-			return
-		}
+		_, _, err = c.SendCommandWaitReply("EMU_RESUME", deadline)
 	}
 
 	return
