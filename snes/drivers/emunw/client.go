@@ -5,9 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"google.golang.org/grpc/codes"
 	"net"
 	"sni/protos/sni"
 	"sni/snes"
@@ -15,8 +13,6 @@ import (
 	"strings"
 	"time"
 )
-
-const hextable = "0123456789abcdef"
 
 type Client struct {
 	addr *net.TCPAddr
@@ -27,21 +23,6 @@ type Client struct {
 	isClosed    bool
 
 	readWriteTimeout time.Duration
-}
-
-// isCloseWorthy returns true if the error should close the connection
-func isCloseWorthy(err error) bool {
-	var coded *snes.CodedError
-	if errors.As(err, &coded) {
-		if coded.Code == codes.Internal {
-			return true
-		}
-		return false
-	}
-	if errors.Is(err, net.ErrClosed) {
-		return false
-	}
-	return true
 }
 
 func NewClient(addr *net.TCPAddr, name string, timeout time.Duration) (c *Client) {
@@ -251,8 +232,91 @@ func (c *Client) MultiWriteMemory(ctx context.Context, writes ...snes.MemoryWrit
 		deadline = time.Now().Add(c.readWriteTimeout)
 	}
 
-	_ = deadline
+	mrsp = make([]snes.MemoryWriteResponse, len(writes))
 
+	// annoyingly, we must track the unique memType keys so we can iterate the map in a consistent order:
+	memTypes := make([]mapping.MemoryType, 0, len(writes))
+	writeGroups := make(map[mapping.MemoryType][]memRegion)
+
+	// divide up the writes into memory type groups:
+	for j, write := range writes {
+		a := &write.RequestAddress
+		memType, pakAddress, offset := mapping.MemoryTypeFor(a)
+
+		mrsp[j].RequestAddress = write.RequestAddress
+		mrsp[j].DeviceAddress = snes.AddressTuple{
+			Address:       pakAddress,
+			AddressSpace:  sni.AddressSpace_FxPakPro,
+			MemoryMapping: write.RequestAddress.MemoryMapping,
+		}
+		mrsp[j].DeviceAddress.Address = pakAddress
+		mrsp[j].Size = len(write.Data)
+
+		regions, ok := writeGroups[memType]
+		if !ok {
+			memTypes = append(memTypes, memType)
+		}
+		writeGroups[memType] = append(regions, memRegion{
+			MemoryType: memType,
+			Offset:     offset,
+			Size:       len(write.Data),
+			Data:       write.Data,
+		})
+	}
+
+	// write commands:
+	for _, memType := range memTypes {
+		regions := writeGroups[memType]
+
+		// write command and build data buffer to send:
+		sb := bytes.Buffer{}
+		data := bytes.Buffer{}
+		size := uint32(0)
+		_, _ = fmt.Fprintf(&sb, "CORE_WRITE %s", memType)
+		for _, region := range regions {
+			_, _ = fmt.Fprintf(&sb, ";$%x;$%x", region.Offset, region.Size)
+			data.Write(region.Data)
+			size += uint32(region.Size)
+		}
+		sb.WriteByte('\n')
+		err = c.writeWithDeadline(sb.Bytes(), deadline)
+		if err != nil {
+			return
+		}
+
+		// write data:
+		sb.Reset()
+		sb.WriteByte(0)
+		_ = binary.Write(&sb, binary.BigEndian, size)
+		sb.Write(data.Bytes())
+		err = c.writeWithDeadline(sb.Bytes(), deadline)
+		if err != nil {
+			return
+		}
+	}
+
+	// read replies:
+	errReplies := strings.Builder{}
+	for range memTypes {
+		var ascii []map[string]string
+		_, ascii, err = c.parseCommandResponse(deadline)
+		if err != nil {
+			return
+		}
+		if ascii != nil {
+			if errText, ok := ascii[0]["error"]; ok {
+				errReplies.WriteString(errText)
+				errReplies.WriteByte('\n')
+			}
+		}
+	}
+
+	if errReplies.Len() > 0 {
+		err = fmt.Errorf("emunw: error=%s", errReplies.String())
+		return
+	}
+
+	err = nil
 	return
 }
 
@@ -307,6 +371,6 @@ func (c *Client) PauseUnpause(ctx context.Context, pausedState bool) (newState b
 	return
 }
 
-func (c *Client) PauseToggle(ctx context.Context) (err error) {
+func (c *Client) PauseToggle(context.Context) (err error) {
 	return fmt.Errorf("capability unavailable")
 }
