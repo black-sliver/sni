@@ -139,7 +139,11 @@ func (c *Client) parseCommandResponse(deadline time.Time) (bin []byte, ascii []m
 	for s.Scan() {
 		l := s.Text()
 		pair := strings.SplitN(l, ":", 2)
-		key, value := pair[0], pair[1]
+		var key string = pair[0]
+		var value string
+		if len(pair) >= 2 {
+			value = pair[1]
+		}
 
 		// duplicate keys delimit multiple items:
 		if _, hasKey := item[key]; hasKey {
@@ -255,6 +259,19 @@ func (c *Client) ResetSystem(ctx context.Context) (err error) {
 	}
 
 	err = c.writeWithDeadline([]byte("EMU_RESET\n"), deadline)
+	if err != nil {
+		return
+	}
+
+	var ascii []map[string]string
+	_, ascii, err = c.parseCommandResponse(deadline)
+	if ascii != nil {
+		if errText, ok := ascii[0]["error"]; ok {
+			err = fmt.Errorf("emunw: error=%s", errText)
+			return
+		}
+	}
+
 	return
 }
 
@@ -264,13 +281,23 @@ func (c *Client) PauseUnpause(ctx context.Context, pausedState bool) (newState b
 		deadline = time.Now().Add(c.readWriteTimeout)
 	}
 
+	newState = pausedState
 	if pausedState {
-		err = c.writeWithDeadline([]byte("EMU_RESUME\n"), deadline)
-	} else {
 		err = c.writeWithDeadline([]byte("EMU_PAUSE\n"), deadline)
+	} else {
+		err = c.writeWithDeadline([]byte("EMU_RESUME\n"), deadline)
 	}
 	if err != nil {
 		return
+	}
+
+	var ascii []map[string]string
+	_, ascii, err = c.parseCommandResponse(deadline)
+	if ascii != nil {
+		if errText, ok := ascii[0]["error"]; ok {
+			err = fmt.Errorf("emunw: error=%s", errText)
+			return
+		}
 	}
 
 	return
