@@ -129,6 +129,7 @@ func (c *Client) parseCommandResponse(deadline time.Time) (bin []byte, ascii []m
 	// expect ascii reply otherwise:
 	if d[0] != '\n' {
 		err = fmt.Errorf("emunw: command reply expected starting with '\\0' or '\\n' but got '%c'", d[0])
+		_ = c.Close()
 		return
 	}
 
@@ -215,6 +216,9 @@ func (c *Client) MultiReadMemory(ctx context.Context, reads ...snes.MemoryReadRe
 		}
 		sb.WriteByte('\n')
 		err = c.writeWithDeadline(sb.Bytes(), deadline)
+		if err != nil {
+			return
+		}
 	}
 
 	// read back responses:
